@@ -23,6 +23,7 @@ from .redis_keys import RedisKeys
 from .constants import ChannelState, EventType, StreamType, ChannelMetadataField, TS_PACKET_SIZE
 from .config_helper import ConfigHelper
 from .url_utils import get_alternate_streams, get_stream_info_for_switch, get_stream_object
+from .ssai_preprocessor import SSAIPreprocessor
 
 logger = get_logger()
 
@@ -49,6 +50,13 @@ class StreamManager:
         self.buffering_start_time = None
         # Store worker_id for ownership checks
         self.worker_id = worker_id
+
+        # SSAI (Server-Side Ad Insertion) support
+        # ssai_mode is set True when the preprocessor detects SSAI markers in
+        # the HLS manifest.  When True, DTS-continuity FFmpeg flags are injected
+        # and stderr splice noise is suppressed so it doesn't trigger failovers.
+        self.ssai_mode = False
+        self._ssai_preprocessor = SSAIPreprocessor()
 
         # Sockets used for transcode jobs
         self.socket = None
@@ -508,7 +516,43 @@ class StreamManager:
                 stream_profile = channel.get_stream_profile()
 
             # Build and start transcode command
+            # --- SSAI: resolve master playlist & detect ad-insertion sources ----
+            # Do this immediately before build_command so the resolved rendition
+            # URL is what FFmpeg receives, not the master playlist.
+            if hasattr(self, 'stream_type') and self.stream_type == StreamType.HLS:
+                try:
+                    resolved_url, is_ssai, ssai_meta = self._ssai_preprocessor.detect_and_resolve(
+                        self.url, self.user_agent
+                    )
+                    if resolved_url != self.url:
+                        logger.info(
+                            f"SSAI: resolved master playlist → rendition for "
+                            f"channel {self.channel_id}: {resolved_url[:100]}"
+                        )
+                        self.url = resolved_url
+                    self.ssai_mode = is_ssai
+                    if is_ssai:
+                        logger.info(
+                            f"SSAI source detected for channel {self.channel_id} "
+                            f"— DTS-continuity flags will be injected"
+                        )
+                except Exception as ssai_exc:
+                    logger.warning(
+                        f"SSAI preprocessor error for channel {self.channel_id} "
+                        f"(continuing without preprocessing): {ssai_exc}"
+                    )
+            # ------------------------------------------------------------------
+
             self.transcode_cmd = stream_profile.build_command(self.url, self.user_agent)
+
+            # Inject SSAI-safe FFmpeg flags when an SSAI source is detected.
+            # Only applied to FFmpeg commands (not VLC / Streamlink).
+            if self.ssai_mode and self.stream_command and self.stream_command.lower() == 'ffmpeg':
+                self.transcode_cmd = SSAIPreprocessor.inject_ssai_flags(self.transcode_cmd)
+                logger.info(
+                    f"SSAI: injected DTS-continuity flags into FFmpeg command "
+                    f"for channel {self.channel_id}"
+                )
 
             # Store stream command for efficient log parser routing
             self.stream_command = stream_profile.command
@@ -683,6 +727,16 @@ class StreamManager:
         try:
             content = content.strip()
             if not content:
+                return
+
+            # Suppress DTS/PTS discontinuity noise that originates from SSAI
+            # ad/content splice boundaries.  These are normal on SSAI sources and
+            # should never trigger the health monitor or inflate the error log.
+            if self.ssai_mode and SSAIPreprocessor.is_ssai_stderr_noise(content):
+                logger.debug(
+                    f"SSAI splice noise suppressed for channel {self.channel_id}: "
+                    f"{content[:120]}"
+                )
                 return
 
             # Convert to lowercase for easier matching
