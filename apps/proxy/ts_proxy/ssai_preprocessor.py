@@ -7,19 +7,20 @@ Three responsibilities:
   1. Resolve HLS master playlists to a single concrete rendition URL before
      handing off to FFmpeg — eliminates rendition ambiguity and prevents FFmpeg
      from silently picking the wrong (often lowest) quality track.
-  2. Detect SSAI sources (Pluto TV, Tubi, etc.) and signal the stream manager
-     to enable DTS-continuity FFmpeg flags that treat ad/content boundary jumps
-     as splices rather than corrupt input.
+  2. Detect SSAI sources and signal the stream manager to enable DTS-continuity
+     FFmpeg flags that treat ad/content boundary jumps as splices rather than
+     corrupt input.  Detection works two ways:
+       a. Manifest marker scan — looks for SCTE-35, EXT-X-DATERANGE, etc. in
+          the playlist body (works on raw Pluto/Tubi manifests).
+       b. Force-host list — when the manifest passes through a local proxy
+          (e.g. TVNow at 192.168.1.254) the markers are stripped, so we force
+          SSAI mode by hostname instead.
   3. Classify FFmpeg stderr lines that look like errors but are actually normal
      SSAI splice noise, so the health monitor doesn't trigger needless failovers.
-
-Drop in as apps/proxy/ts_proxy/ssai_preprocessor.py.
-Import in stream_manager.py as shown at the bottom of this file.
 """
 
 import re
 import logging
-import time
 from typing import Optional, Tuple, Dict, Any
 from urllib.parse import urljoin, urlparse
 
@@ -69,10 +70,30 @@ class HLSVariant:
 
 
 # ---------------------------------------------------------------------------
-# SSAI detection patterns
+# Force-host list
+#
+# Hosts listed here are unconditionally treated as SSAI sources regardless of
+# whether their manifests contain detectable markers.  Add your TVNow/proxy
+# host here when its manifests strip SSAI tags before Dispatcharr sees them.
 # ---------------------------------------------------------------------------
 
-# Manifest-level strings that reliably indicate SSAI
+_SSAI_FORCE_HOSTS = {
+    # TVNow local proxy — Pluto manifests arrive here with SCTE-35 stripped
+    "192.168.1.254",
+    # Pluto TV CDN hostnames — used when Dispatcharr gets a raw Pluto URL
+    "silo.pluto.tv",
+    "siloh-ns1.plutotv.net",
+    "content.plutotv.net",
+}
+
+
+# ---------------------------------------------------------------------------
+# Manifest-level SSAI marker strings
+#
+# Checked case-insensitively against the raw manifest body.  A single match
+# is enough to declare the source an SSAI stream.
+# ---------------------------------------------------------------------------
+
 _SSAI_MANIFEST_MARKERS = [
     "scte35",
     "ext-x-daterange",
@@ -84,27 +105,48 @@ _SSAI_MANIFEST_MARKERS = [
     "ssai.",
     "adpod",
     "ext-x-splicepoint",
+    # Pluto-specific — present in raw CDN manifests
+    "pluto.tv",
+    "siloh-ns1.plutotv.net",
+    # Tubi / Fox SSAI
+    "tubi.tv/vast",
+    "foxdcg.com",
 ]
 
-# FFmpeg stderr patterns that are SSAI splice noise, not real errors.
-# Each is a compiled regex checked against the lowercased stderr line.
+
+# ---------------------------------------------------------------------------
+# FFmpeg stderr noise patterns
+#
+# Lines matching any of these during SSAI playback are splice artifacts, not
+# real errors.  They are suppressed so the health monitor never mistakes a
+# normal ad-break DTS reset for a stream failure.
+# ---------------------------------------------------------------------------
+
 _SSAI_STDERR_NOISE_PATTERNS = [
     re.compile(r"dts .{0,40} out of order"),
     re.compile(r"pts .{0,40} out of order"),
-    re.compile(r"non.monoton"),                 # "non monotonous DTS"
+    re.compile(r"non.monoton"),                       # "non monotonous DTS"
     re.compile(r"dts .{0,20}, next: .{0,20} st:"),
     re.compile(r"application provided invalid"),
     re.compile(r"pts has no value"),
     re.compile(r"st: \d+, invalid"),
-    re.compile(r"discarding"),                   # "discarding corrupt packet"
+    re.compile(r"packet corrupt"),                    # "Packet corrupt (stream=2…)"
+    re.compile(r"discarding"),                        # "discarding corrupt packet"
     re.compile(r"discontinuity detected"),
     re.compile(r"missing pts"),
+    re.compile(r"timestamp discontinuity"),           # "[aist#0:0] timestamp discontinuity"
+    re.compile(r"new data stream"),                   # "[in#0/hls] New data stream with index"
+    re.compile(r"new offset="),                       # "new offset= 731048000"
+    re.compile(r"dropping it"),                       # "dropping it." from corrupt packet log
 ]
 
-# FFmpeg input-side flags to inject for SSAI sources.
-# Inserted immediately before the first -i in the command list.
+
+# ---------------------------------------------------------------------------
+# FFmpeg input-side flags injected for all SSAI sources
+# ---------------------------------------------------------------------------
+
 _SSAI_INPUT_FLAGS = [
-    "-fflags",        "+genpts+discardcorrupt+igndts",
+    "-fflags",            "+genpts+discardcorrupt+igndts",
     "-avoid_negative_ts", "make_zero",
     "-ignore_unknown",
 ]
@@ -118,26 +160,11 @@ class SSAIPreprocessor:
     """
     Resolves HLS master playlists and detects SSAI sources.
 
-    Typical usage inside stream_manager._establish_transcode_connection():
-
-        preprocessor = SSAIPreprocessor()
-        resolved_url, is_ssai, meta = preprocessor.detect_and_resolve(
-            self.url, self.user_agent
-        )
-        if resolved_url != self.url:
-            logger.info(f"SSAI: resolved master → {resolved_url}")
-            self.url = resolved_url
-        self.ssai_mode = is_ssai
-
-        self.transcode_cmd = stream_profile.build_command(self.url, self.user_agent)
-
-        if self.ssai_mode:
-            self.transcode_cmd = SSAIPreprocessor.inject_ssai_flags(self.transcode_cmd)
+    Call detect_and_resolve() once per stream start (before build_command).
+    Use inject_ssai_flags() to rewrite the FFmpeg command when is_ssai=True.
+    Use is_ssai_stderr_noise() in _log_stderr_content() to suppress splice noise.
     """
 
-    # Rendition height preference. If you want to prefer 720p to save CPU,
-    # lower this.  The selector picks the best rendition ≤ preferred_height,
-    # or the lowest rendition above it if none qualify.
     DEFAULT_PREFERRED_HEIGHT = 1080
 
     def __init__(self, session: Optional[requests.Session] = None, timeout: float = 8.0):
@@ -155,25 +182,14 @@ class SSAIPreprocessor:
         preferred_height: int = DEFAULT_PREFERRED_HEIGHT,
     ) -> Tuple[str, bool, Dict[str, Any]]:
         """
-        Inspect *url* and, if it is an HLS master playlist, resolve it to the
-        best single-rendition media playlist URL.
+        Inspect *url* and resolve HLS master playlists to a single rendition.
+
+        Force-host check runs first so that even when a local proxy strips SSAI
+        markers from the manifest body, the DTS-continuity flags still get armed.
 
         Returns
         -------
         (resolved_url, is_ssai, metadata)
-
-        resolved_url : str
-            The concrete media playlist URL, or the original URL if resolution
-            was not needed / not possible.
-        is_ssai : bool
-            True when SSAI markers were detected in the manifest body.
-        metadata : dict
-            Extra hints the caller may use:
-              'is_master'     – was the original URL a master playlist?
-              'ssai_mode'     – same as is_ssai (convenience copy)
-              'audio_url'     – separate audio rendition URL, if any
-              'original_url'  – the unmodified input URL
-              'resolved_url'  – the selected rendition URL
         """
         meta: Dict[str, Any] = {
             "is_master": False,
@@ -183,6 +199,28 @@ class SSAIPreprocessor:
             "resolved_url": url,
         }
 
+        # ------------------------------------------------------------------
+        # Step 1 — force-host check
+        # If the URL's hostname is in _SSAI_FORCE_HOSTS we know it is an SSAI
+        # source regardless of manifest content.  We still fetch the manifest
+        # to resolve master → rendition, but skip the marker scan.
+        # ------------------------------------------------------------------
+        parsed = urlparse(url)
+        hostname = parsed.hostname or ""
+        force_ssai = hostname in _SSAI_FORCE_HOSTS
+
+        if force_ssai:
+            logger.info(
+                f"SSAI: force-enabled for known SSAI host {hostname!r} — "
+                f"DTS-continuity flags will be injected"
+            )
+            meta["ssai_mode"] = True
+            resolved_url = self._resolve_master_only(url, user_agent, preferred_height, meta)
+            return resolved_url, True, meta
+
+        # ------------------------------------------------------------------
+        # Step 2 — fetch manifest and run marker scan + rendition resolution
+        # ------------------------------------------------------------------
         try:
             headers = {"User-Agent": user_agent}
             resp = self._session.get(
@@ -191,12 +229,11 @@ class SSAIPreprocessor:
             resp.raise_for_status()
 
             content_type = resp.headers.get("Content-Type", "").lower()
-            # Read the manifest body – cap at 256 KB to avoid runaway reads
             body = resp.content[:262144].decode("utf-8", errors="replace")
             resp.close()
 
             if not self._is_hls_content(content_type, body):
-                logger.debug(f"SSAI: {url!r} does not appear to be HLS, skipping")
+                logger.debug(f"SSAI: {url!r} is not HLS, skipping")
                 return url, False, meta
 
             is_ssai = self._detect_ssai_markers(body)
@@ -207,7 +244,7 @@ class SSAIPreprocessor:
                 logger.debug(f"SSAI: {url!r} is a media playlist (ssai={is_ssai})")
                 return url, is_ssai, meta
 
-            # ---- Master playlist ----------------------------------------
+            # Master playlist — resolve to best rendition
             meta["is_master"] = True
             variants = self._parse_master_playlist(body, url)
 
@@ -220,13 +257,8 @@ class SSAIPreprocessor:
                 f"SSAI: master → rendition  bw={best.bandwidth}  "
                 f"res={best.resolution or '?'}  {best.url[:80]}"
             )
-
             meta["resolved_url"] = best.url
-            meta["audio_group"] = best.audio_group
 
-            # Look for a dedicated audio rendition (muxed into the video
-            # playlist already on most sources, but some SSAI providers
-            # keep a separate EXT-X-MEDIA audio group)
             if best.audio_group:
                 audio_url = self._find_default_audio_url(body, best.audio_group, url)
                 if audio_url:
@@ -243,16 +275,15 @@ class SSAIPreprocessor:
             return url, False, meta
 
     # ------------------------------------------------------------------
-    # Static helpers (usable without an instance)
+    # Static helpers
     # ------------------------------------------------------------------
 
     @staticmethod
     def is_ssai_stderr_noise(line: str) -> bool:
         """
-        Return True when *line* (FFmpeg stderr) is SSAI splice noise rather
-        than a real error.  Call this in stream_manager._log_stderr_content()
-        to suppress spurious error-level log entries and prevent the health
-        monitor from triggering a failover on every ad break.
+        Return True when *line* is SSAI splice noise rather than a real error.
+        Call this in stream_manager._log_stderr_content() before routing to
+        the error logger or health monitor.
         """
         ll = line.lower()
         return any(p.search(ll) for p in _SSAI_STDERR_NOISE_PATTERNS)
@@ -260,23 +291,16 @@ class SSAIPreprocessor:
     @staticmethod
     def inject_ssai_flags(cmd: list) -> list:
         """
-        Rewrite an FFmpeg command list to include SSAI-safe input flags.
+        Rewrite an FFmpeg command list to include SSAI-safe input flags,
+        inserted immediately before the first -i argument.
 
-        The injected flags are inserted immediately before the first ``-i``
-        argument so they apply to the input session, not a later output::
-
-            ffmpeg -fflags +genpts+discardcorrupt+igndts
-                   -avoid_negative_ts make_zero
-                   -ignore_unknown
-                   -i <url> …
-
-        If ``-i`` is not found the flags are prepended after the binary name.
-        Returns the original list unchanged if it is empty.
+        ffmpeg [existing flags…] -fflags +genpts+discardcorrupt+igndts
+               -avoid_negative_ts make_zero -ignore_unknown -i <url> …
         """
         if not cmd:
             return cmd
 
-        result = [cmd[0]]          # ffmpeg / cvlc binary — keep as-is
+        result = [cmd[0]]   # binary name unchanged
         rest = cmd[1:]
 
         i_idx = next((i for i, a in enumerate(rest) if a == "-i"), None)
@@ -294,6 +318,60 @@ class SSAIPreprocessor:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _resolve_master_only(
+        self,
+        url: str,
+        user_agent: str,
+        preferred_height: int,
+        meta: Dict[str, Any],
+    ) -> str:
+        """
+        Fetch the manifest for a force-SSAI host and resolve master → rendition
+        without running the marker scan (we already know it's SSAI).
+        Returns the resolved URL, or the original URL on any error.
+        """
+        try:
+            headers = {"User-Agent": user_agent}
+            resp = self._session.get(
+                url, headers=headers, timeout=self._timeout, stream=True
+            )
+            resp.raise_for_status()
+            content_type = resp.headers.get("Content-Type", "").lower()
+            body = resp.content[:262144].decode("utf-8", errors="replace")
+            resp.close()
+
+            if not self._is_hls_content(content_type, body):
+                return url
+
+            if "#EXT-X-STREAM-INF" not in body:
+                return url
+
+            meta["is_master"] = True
+            variants = self._parse_master_playlist(body, url)
+            if not variants:
+                return url
+
+            best = self._select_best_variant(variants, preferred_height)
+            logger.info(
+                f"SSAI: master → rendition  bw={best.bandwidth}  "
+                f"res={best.resolution or '?'}  {best.url[:80]}"
+            )
+            meta["resolved_url"] = best.url
+
+            if best.audio_group:
+                audio_url = self._find_default_audio_url(body, best.audio_group, url)
+                if audio_url:
+                    meta["audio_url"] = audio_url
+
+            return best.url
+
+        except Exception as exc:
+            logger.warning(
+                f"SSAI: manifest fetch failed for force-host {url!r}: {exc} — "
+                f"continuing with original URL"
+            )
+            return url
 
     @staticmethod
     def _is_hls_content(content_type: str, body: str) -> bool:
@@ -317,12 +395,9 @@ class SSAIPreprocessor:
 
     @staticmethod
     def _parse_attributes(attr_string: str) -> Dict[str, str]:
-        """Parse an HLS attribute list string into a plain dict."""
-        # Strip tag prefix (everything up to and including the first ':')
         if ":" in attr_string:
             attr_string = attr_string.split(":", 1)[1]
         attrs: Dict[str, str] = {}
-        # Match KEY=VALUE where VALUE is either quoted or unquoted
         for m in re.finditer(
             r'([A-Z0-9_-]+)=("(?:[^"\\]|\\.)*"|[^,]+)', attr_string
         ):
@@ -338,7 +413,6 @@ class SSAIPreprocessor:
             if line.startswith("#EXT-X-STREAM-INF"):
                 attrs = self._parse_attributes(line)
                 i += 1
-                # Skip blank lines to reach the rendition URI
                 while i < len(lines) and not lines[i].strip():
                     i += 1
                 if i < len(lines):
@@ -366,18 +440,13 @@ class SSAIPreprocessor:
         return variants
 
     @staticmethod
-    def _select_best_variant(
-        variants: list, preferred_height: int
-    ) -> HLSVariant:
+    def _select_best_variant(variants: list, preferred_height: int) -> HLSVariant:
         """
-        Selection strategy:
-          1. Among renditions with height ≤ preferred_height, take the tallest
-             (highest fidelity that won't exceed the preference), breaking ties
-             by highest bandwidth.
-          2. If nothing is ≤ preferred_height, take the *shortest* rendition
-             above it (closest to the preference), breaking ties by highest
-             bandwidth.
-          3. If no resolution info is present, take the highest bandwidth.
+        Pick best rendition:
+          1. Tallest variant with height <= preferred_height (highest quality
+             that doesn't exceed the preference), tiebreak by bandwidth.
+          2. If nothing qualifies, the shortest variant above preferred_height.
+          3. If no resolution data at all, highest bandwidth.
         """
         with_res = [v for v in variants if v.height > 0]
         no_res   = [v for v in variants if v.height == 0]
@@ -398,7 +467,6 @@ class SSAIPreprocessor:
     def _find_default_audio_url(
         self, body: str, audio_group: str, base_url: str
     ) -> Optional[str]:
-        """Return the URI of the DEFAULT=YES audio rendition for *audio_group*."""
         for line in body.splitlines():
             if "#EXT-X-MEDIA" not in line:
                 continue
@@ -412,61 +480,3 @@ class SSAIPreprocessor:
                 if uri:
                     return urljoin(base_url, uri)
         return None
-
-
-# ---------------------------------------------------------------------------
-# stream_manager.py integration guide (copy the snippets below)
-# ---------------------------------------------------------------------------
-#
-# 1. IMPORT  (top of stream_manager.py, with other local imports)
-# ----------------------------------------------------------------
-#   from .ssai_preprocessor import SSAIPreprocessor
-#
-#
-# 2. __init__  (inside StreamManager.__init__, after existing attrs)
-# -----------------------------------------------------------------
-#   # SSAI support
-#   self.ssai_mode = False
-#   self._ssai_preprocessor = SSAIPreprocessor()
-#
-#
-# 3. _establish_transcode_connection  (before build_command call)
-# --------------------------------------------------------------
-#   # --- SSAI: resolve master playlist & detect ad-insertion sources ---
-#   if hasattr(self, 'stream_type') and self.stream_type == StreamType.HLS:
-#       resolved_url, is_ssai, ssai_meta = self._ssai_preprocessor.detect_and_resolve(
-#           self.url, self.user_agent
-#       )
-#       if resolved_url != self.url:
-#           logger.info(
-#               f"SSAI: resolved master playlist to rendition URL "
-#               f"for channel {self.channel_id}: {resolved_url[:80]}"
-#           )
-#           self.url = resolved_url
-#       self.ssai_mode = is_ssai
-#       if is_ssai:
-#           logger.info(
-#               f"SSAI source detected for channel {self.channel_id} "
-#               f"— enabling DTS-continuity flags"
-#           )
-#   # -------------------------------------------------------------------
-#
-#   self.transcode_cmd = stream_profile.build_command(self.url, self.user_agent)
-#
-#   # Inject SSAI-safe FFmpeg flags AFTER build_command
-#   if self.ssai_mode and self.stream_command and self.stream_command.lower() == 'ffmpeg':
-#       self.transcode_cmd = SSAIPreprocessor.inject_ssai_flags(self.transcode_cmd)
-#       logger.info(f"SSAI: injected DTS-continuity flags for channel {self.channel_id}")
-#
-#
-# 4. _log_stderr_content  (at the very top of the method, before any routing)
-# ---------------------------------------------------------------------------
-#   # Suppress SSAI splice noise so the health monitor doesn't false-positive
-#   if getattr(self, 'ssai_mode', False) and SSAIPreprocessor.is_ssai_stderr_noise(content):
-#       logger.debug(
-#           f"SSAI splice noise suppressed for channel {self.channel_id}: "
-#           f"{content[:120]}"
-#       )
-#       return
-#
-# ---------------------------------------------------------------------------
