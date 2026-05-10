@@ -547,7 +547,11 @@ class StreamManager:
 
             # Inject SSAI-safe FFmpeg flags when an SSAI source is detected.
             # Only applied to FFmpeg commands (not VLC / Streamlink).
-            if self.ssai_mode and self.stream_command and self.stream_command.lower() == 'ffmpeg':
+            # NOTE: self.stream_command is not yet assigned here — check
+            # transcode_cmd[0] directly instead.
+            if (self.ssai_mode
+                    and self.transcode_cmd
+                    and 'ffmpeg' in self.transcode_cmd[0].lower()):
                 self.transcode_cmd = SSAIPreprocessor.inject_ssai_flags(self.transcode_cmd)
                 logger.info(
                     f"SSAI: injected DTS-continuity flags into FFmpeg command "
