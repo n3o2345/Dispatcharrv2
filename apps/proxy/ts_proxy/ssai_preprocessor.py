@@ -147,8 +147,15 @@ _SSAI_STDERR_NOISE_PATTERNS = [
 
 _SSAI_INPUT_FLAGS = [
     "-fflags",            "+genpts+discardcorrupt+igndts",
-    "-avoid_negative_ts", "make_zero",
+    # 'auto' only shifts timestamps when they'd go negative — 'make_zero' was
+    # forcing a full mux-session reset at every ad/content DTS boundary, which
+    # caused FFmpeg to hold the output pipe for ~12s while it recalculated the
+    # new zero baseline.
+    "-avoid_negative_ts", "auto",
     "-ignore_unknown",
+    # Flush the pipe immediately at discontinuities instead of buffering while
+    # waiting for audio/video interleave alignment across the DTS gap.
+    "-max_delay",         "0",
 ]
 
 
